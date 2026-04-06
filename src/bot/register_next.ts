@@ -199,11 +199,44 @@ const ORDER_ACTION_SAME_ORDER_MAX = 2;
 const MIN_COMMERCIAL_PACKAGE_AMOUNT = 5;
 let resolvedSupportChatId = env.supportChatId;
 let supportPinPermissionUnavailable = false;
+const supportReplyPromptTargets = new Map<string, number>();
 
 function parseStartPayload(text: string | undefined): string | undefined {
   if (!text) return undefined;
   const parts = text.split(' ');
   return parts[1];
+}
+
+function getSupportPromptKey(chatId: string | number | undefined, messageId: number | undefined): string | null {
+  if (chatId === undefined || messageId === undefined) {
+    return null;
+  }
+
+  return `${String(chatId)}:${String(messageId)}`;
+}
+
+function rememberSupportReplyPrompt(chatId: string | number | undefined, messageId: number | undefined, ticketId: number): void {
+  const key = getSupportPromptKey(chatId, messageId);
+  if (!key) {
+    return;
+  }
+
+  supportReplyPromptTargets.set(key, ticketId);
+}
+
+function consumeSupportReplyPrompt(chatId: string | number | undefined, messageId: number | undefined): number | null {
+  const key = getSupportPromptKey(chatId, messageId);
+  if (!key) {
+    return null;
+  }
+
+  const ticketId = supportReplyPromptTargets.get(key);
+  if (!ticketId) {
+    return null;
+  }
+
+  supportReplyPromptTargets.delete(key);
+  return ticketId;
 }
 
 function setResolvedSupportChatId(chatId: string | number | null | undefined): void {
@@ -265,6 +298,38 @@ function isPinnedMessagesPermissionError(error: unknown): boolean {
 
   const description = (error as { response?: { description?: string } }).response?.description ?? '';
   return description.toLowerCase().includes('not enough rights to manage pinned messages');
+}
+
+function getSupportActorId(ctx: MyContext): number | undefined {
+  const senderChatId = 'message' in ctx && ctx.message && 'sender_chat' in ctx.message
+    ? (ctx.message.sender_chat as { id?: number } | undefined)?.id
+    : undefined;
+
+  return senderChatId ?? ctx.from?.id;
+}
+
+function getSupportAgentDisplayName(ctx: MyContext): string {
+  if ('message' in ctx && ctx.message && 'sender_chat' in ctx.message) {
+    const senderChat = ctx.message.sender_chat as { title?: string; username?: string } | undefined;
+    if (senderChat?.title) {
+      return senderChat.title;
+    }
+    if (senderChat?.username) {
+      return `@${senderChat.username}`;
+    }
+  }
+
+  const from = ctx.from;
+  if (!from) {
+    return 'Equipe RatoAcess';
+  }
+
+  if (from.username) {
+    return `@${from.username}`;
+  }
+
+  const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+  return fullName || 'Equipe RatoAcess';
 }
 
 async function callSupportChatApi<T>(
@@ -973,19 +1038,6 @@ async function notifySupportTeam(
   }
 }
 
-function getSupportAgentDisplayName(from?: MyContext['from']): string {
-  if (!from) {
-    return 'Equipe RatoAcess';
-  }
-
-  if (from.username) {
-    return `@${from.username}`;
-  }
-
-  const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
-  return fullName || 'Equipe RatoAcess';
-}
-
 function buildSupportReplyMessage(agentName: string, reply: string): string {
   return [
     `👤 Atendente: ${agentName}`,
@@ -1032,7 +1084,7 @@ async function replyToSupportTicket(
   ticketId: number,
   reply: string
 ): Promise<void> {
-  const senderId = ctx.from?.id;
+  const senderId = getSupportActorId(ctx);
   if (!senderId) {
     return;
   }
@@ -1043,7 +1095,7 @@ async function replyToSupportTicket(
     return;
   }
 
-  const agentName = getSupportAgentDisplayName(ctx.from);
+  const agentName = getSupportAgentDisplayName(ctx);
   const cleanReply = reply.trim();
   const decoratedReply = buildSupportReplyMessage(agentName, cleanReply);
 
@@ -1075,7 +1127,7 @@ async function closeSupportTicketFromTeam(
     return;
   }
 
-  await closeSupportTicket(ticketId, ctx.from?.id, getSupportAgentDisplayName(ctx.from));
+  await closeSupportTicket(ticketId, getSupportActorId(ctx), getSupportAgentDisplayName(ctx));
   const delivered = await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
   await ctx.reply(
     delivered
@@ -2212,12 +2264,16 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
     };
 
     await ctx.answerCbQuery();
-    await ctx.reply(getSupportAdminReplyPrompt(ticket), {
+    const prompt = await ctx.reply(getSupportAdminReplyPrompt(ticket), {
+      reply_parameters: ctx.callbackQuery.message?.message_id
+        ? { message_id: ctx.callbackQuery.message.message_id }
+        : undefined,
       reply_markup: {
         force_reply: true,
         selective: true
       }
     });
+    rememberSupportReplyPrompt(ctx.chat?.id, prompt.message_id, ticket.id);
   });
 
   bot.action(/support_admin_close:(\d+)/, async (ctx) => {
@@ -2698,15 +2754,35 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
 
   bot.on('text', async (ctx, next) => {
     const senderId = ctx.from?.id;
-    const supportSession = ctx.session.support;
-    if (supportSession && senderId) {
-      const messageText = ctx.message.text.trim();
-      if (messageText.length < 6) {
-        await ctx.reply('✍️ Me envie um pouco mais de contexto para eu abrir ou atualizar o atendimento.');
+    const messageText = ctx.message.text.trim();
+
+    if (
+      isSupportTeamContext(ctx)
+      && 'reply_to_message' in ctx.message
+      && ctx.message.reply_to_message
+      && !messageText.startsWith('/')
+    ) {
+      const promptTicketId = consumeSupportReplyPrompt(ctx.chat?.id, ctx.message.reply_to_message.message_id);
+      if (promptTicketId) {
+        await replyToSupportTicket(bot, ctx, promptTicketId, messageText);
         return;
       }
 
+      const repliedTicketId = extractTicketIdFromSupportThreadMessage(ctx.message.reply_to_message);
+      if (repliedTicketId) {
+        await replyToSupportTicket(bot, ctx, repliedTicketId, messageText);
+        return;
+      }
+    }
+
+    const supportSession = ctx.session.support;
+    if (supportSession && senderId) {
       if (supportSession.mode === 'awaiting_description' && supportSession.category) {
+        if (messageText.length < 6) {
+          await ctx.reply('✍️ Me envie um pouco mais de contexto para eu abrir ou atualizar o atendimento.');
+          return;
+        }
+
         const createdTicket = await createSupportTicket({
           telegramId: senderId,
           category: supportSession.category,
@@ -2730,6 +2806,11 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
       }
 
       if (supportSession.mode === 'awaiting_user_reply' && supportSession.ticketId) {
+        if (messageText.length < 2) {
+          await ctx.reply('✍️ Me envie uma resposta um pouco mais completa para eu atualizar o ticket.');
+          return;
+        }
+
         const ticket = await getSupportTicketForUser(senderId, supportSession.ticketId);
         if (!ticket || ticket.status === 'closed') {
           resetSupportSession(ctx);
@@ -2754,6 +2835,11 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
       }
 
       if (supportSession.mode === 'awaiting_admin_reply' && supportSession.ticketId && isSupportTeamContext(ctx)) {
+        if (messageText.length < 2) {
+          await ctx.reply('✍️ Me envie uma resposta um pouco mais completa para eu encaminhar ao cliente.');
+          return;
+        }
+
         const ticket = await getSupportTicketById(supportSession.ticketId);
         if (!ticket || ticket.status === 'closed') {
           resetSupportSession(ctx);
@@ -2768,21 +2854,7 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
     }
 
     const orderCare = ctx.session.orderCare;
-    if (
-      isSupportTeamContext(ctx)
-      && 'reply_to_message' in ctx.message
-      && ctx.message.reply_to_message
-      && !ctx.message.text.trim().startsWith('/')
-    ) {
-      const repliedTicketId = extractTicketIdFromSupportThreadMessage(ctx.message.reply_to_message);
-      if (repliedTicketId) {
-        await replyToSupportTicket(bot, ctx, repliedTicketId, ctx.message.text.trim());
-        return;
-      }
-    }
-
     if (orderCare && senderId) {
-      const messageText = ctx.message.text.trim();
       const orderId = Number(messageText.replace(/[^\d]/g, ''));
 
       if (!Number.isInteger(orderId) || orderId <= 0) {

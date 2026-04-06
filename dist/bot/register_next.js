@@ -19,11 +19,37 @@ const ORDER_ACTION_SAME_ORDER_MAX = 2;
 const MIN_COMMERCIAL_PACKAGE_AMOUNT = 5;
 let resolvedSupportChatId = env.supportChatId;
 let supportPinPermissionUnavailable = false;
+const supportReplyPromptTargets = new Map();
 function parseStartPayload(text) {
     if (!text)
         return undefined;
     const parts = text.split(' ');
     return parts[1];
+}
+function getSupportPromptKey(chatId, messageId) {
+    if (chatId === undefined || messageId === undefined) {
+        return null;
+    }
+    return `${String(chatId)}:${String(messageId)}`;
+}
+function rememberSupportReplyPrompt(chatId, messageId, ticketId) {
+    const key = getSupportPromptKey(chatId, messageId);
+    if (!key) {
+        return;
+    }
+    supportReplyPromptTargets.set(key, ticketId);
+}
+function consumeSupportReplyPrompt(chatId, messageId) {
+    const key = getSupportPromptKey(chatId, messageId);
+    if (!key) {
+        return null;
+    }
+    const ticketId = supportReplyPromptTargets.get(key);
+    if (!ticketId) {
+        return null;
+    }
+    supportReplyPromptTargets.delete(key);
+    return ticketId;
 }
 function setResolvedSupportChatId(chatId) {
     if (chatId === undefined || chatId === null) {
@@ -66,6 +92,32 @@ function isPinnedMessagesPermissionError(error) {
     }
     const description = error.response?.description ?? '';
     return description.toLowerCase().includes('not enough rights to manage pinned messages');
+}
+function getSupportActorId(ctx) {
+    const senderChatId = 'message' in ctx && ctx.message && 'sender_chat' in ctx.message
+        ? ctx.message.sender_chat?.id
+        : undefined;
+    return senderChatId ?? ctx.from?.id;
+}
+function getSupportAgentDisplayName(ctx) {
+    if ('message' in ctx && ctx.message && 'sender_chat' in ctx.message) {
+        const senderChat = ctx.message.sender_chat;
+        if (senderChat?.title) {
+            return senderChat.title;
+        }
+        if (senderChat?.username) {
+            return `@${senderChat.username}`;
+        }
+    }
+    const from = ctx.from;
+    if (!from) {
+        return 'Equipe RatoAcess';
+    }
+    if (from.username) {
+        return `@${from.username}`;
+    }
+    const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+    return fullName || 'Equipe RatoAcess';
 }
 async function callSupportChatApi(bot, method, payload) {
     const candidates = getSupportChatIdCandidates(payload.chat_id);
@@ -615,16 +667,6 @@ async function notifySupportTeam(bot, ticket, messageText) {
         console.error('Falha ao notificar suporte:', error);
     }
 }
-function getSupportAgentDisplayName(from) {
-    if (!from) {
-        return 'Equipe RatoAcess';
-    }
-    if (from.username) {
-        return `@${from.username}`;
-    }
-    const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
-    return fullName || 'Equipe RatoAcess';
-}
 function buildSupportReplyMessage(agentName, reply) {
     return [
         `👤 Atendente: ${agentName}`,
@@ -653,7 +695,7 @@ async function notifyCustomerReply(bot, ticketId, customerTelegramId, reply, clo
     }
 }
 async function replyToSupportTicket(bot, ctx, ticketId, reply) {
-    const senderId = ctx.from?.id;
+    const senderId = getSupportActorId(ctx);
     if (!senderId) {
         return;
     }
@@ -662,7 +704,7 @@ async function replyToSupportTicket(bot, ctx, ticketId, reply) {
         await ctx.reply('⚠️ Esse ticket nao esta disponivel para resposta.');
         return;
     }
-    const agentName = getSupportAgentDisplayName(ctx.from);
+    const agentName = getSupportAgentDisplayName(ctx);
     const cleanReply = reply.trim();
     const decoratedReply = buildSupportReplyMessage(agentName, cleanReply);
     await addSupportMessage({
@@ -684,7 +726,7 @@ async function closeSupportTicketFromTeam(bot, ctx, ticketId) {
         await ctx.reply('⚠️ Ticket nao encontrado.');
         return;
     }
-    await closeSupportTicket(ticketId, ctx.from?.id, getSupportAgentDisplayName(ctx.from));
+    await closeSupportTicket(ticketId, getSupportActorId(ctx), getSupportAgentDisplayName(ctx));
     const delivered = await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
     await ctx.reply(delivered
         ? getSupportAdminTicketClosedMessage(ticketId)
@@ -1552,12 +1594,16 @@ export function registerBotHandlers(bot) {
             customerTelegramId: ticket.telegram_id
         };
         await ctx.answerCbQuery();
-        await ctx.reply(getSupportAdminReplyPrompt(ticket), {
+        const prompt = await ctx.reply(getSupportAdminReplyPrompt(ticket), {
+            reply_parameters: ctx.callbackQuery.message?.message_id
+                ? { message_id: ctx.callbackQuery.message.message_id }
+                : undefined,
             reply_markup: {
                 force_reply: true,
                 selective: true
             }
         });
+        rememberSupportReplyPrompt(ctx.chat?.id, prompt.message_id, ticket.id);
     });
     bot.action(/support_admin_close:(\d+)/, async (ctx) => {
         if (!isSupportTeamContext(ctx)) {
@@ -1940,14 +1986,29 @@ export function registerBotHandlers(bot) {
     });
     bot.on('text', async (ctx, next) => {
         const senderId = ctx.from?.id;
-        const supportSession = ctx.session.support;
-        if (supportSession && senderId) {
-            const messageText = ctx.message.text.trim();
-            if (messageText.length < 6) {
-                await ctx.reply('✍️ Me envie um pouco mais de contexto para eu abrir ou atualizar o atendimento.');
+        const messageText = ctx.message.text.trim();
+        if (isSupportTeamContext(ctx)
+            && 'reply_to_message' in ctx.message
+            && ctx.message.reply_to_message
+            && !messageText.startsWith('/')) {
+            const promptTicketId = consumeSupportReplyPrompt(ctx.chat?.id, ctx.message.reply_to_message.message_id);
+            if (promptTicketId) {
+                await replyToSupportTicket(bot, ctx, promptTicketId, messageText);
                 return;
             }
+            const repliedTicketId = extractTicketIdFromSupportThreadMessage(ctx.message.reply_to_message);
+            if (repliedTicketId) {
+                await replyToSupportTicket(bot, ctx, repliedTicketId, messageText);
+                return;
+            }
+        }
+        const supportSession = ctx.session.support;
+        if (supportSession && senderId) {
             if (supportSession.mode === 'awaiting_description' && supportSession.category) {
+                if (messageText.length < 6) {
+                    await ctx.reply('✍️ Me envie um pouco mais de contexto para eu abrir ou atualizar o atendimento.');
+                    return;
+                }
                 const createdTicket = await createSupportTicket({
                     telegramId: senderId,
                     category: supportSession.category,
@@ -1965,6 +2026,10 @@ export function registerBotHandlers(bot) {
                 return;
             }
             if (supportSession.mode === 'awaiting_user_reply' && supportSession.ticketId) {
+                if (messageText.length < 2) {
+                    await ctx.reply('✍️ Me envie uma resposta um pouco mais completa para eu atualizar o ticket.');
+                    return;
+                }
                 const ticket = await getSupportTicketForUser(senderId, supportSession.ticketId);
                 if (!ticket || ticket.status === 'closed') {
                     resetSupportSession(ctx);
@@ -1986,6 +2051,10 @@ export function registerBotHandlers(bot) {
                 return;
             }
             if (supportSession.mode === 'awaiting_admin_reply' && supportSession.ticketId && isSupportTeamContext(ctx)) {
+                if (messageText.length < 2) {
+                    await ctx.reply('✍️ Me envie uma resposta um pouco mais completa para eu encaminhar ao cliente.');
+                    return;
+                }
                 const ticket = await getSupportTicketById(supportSession.ticketId);
                 if (!ticket || ticket.status === 'closed') {
                     resetSupportSession(ctx);
@@ -1998,18 +2067,7 @@ export function registerBotHandlers(bot) {
             }
         }
         const orderCare = ctx.session.orderCare;
-        if (isSupportTeamContext(ctx)
-            && 'reply_to_message' in ctx.message
-            && ctx.message.reply_to_message
-            && !ctx.message.text.trim().startsWith('/')) {
-            const repliedTicketId = extractTicketIdFromSupportThreadMessage(ctx.message.reply_to_message);
-            if (repliedTicketId) {
-                await replyToSupportTicket(bot, ctx, repliedTicketId, ctx.message.text.trim());
-                return;
-            }
-        }
         if (orderCare && senderId) {
-            const messageText = ctx.message.text.trim();
             const orderId = Number(messageText.replace(/[^\d]/g, ''));
             if (!Number.isInteger(orderId) || orderId <= 0) {
                 await ctx.reply('📦 Envie apenas o numero do pedido, sem texto extra.', orderCarePromptInline(orderCare.action));
