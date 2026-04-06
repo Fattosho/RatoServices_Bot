@@ -1,0 +1,28 @@
+# Ignore local dependency files
+node_modules/
+dist-test/
+
+# Ignore local tests and debug
+api_debug.txt
+api_debug_err.txt
+test-api.ts
+test-categories.ts
+list-cats.ts
+smm_test.json
+
+# Ignore generic source control and local-only files
+.git/
+.github/
+.vscode/
+.history/
+RatoServicesBot/
+
+# Ignore docker files
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Ignore readme and non-essentials
+README.md
+LICENSE
+docs/
