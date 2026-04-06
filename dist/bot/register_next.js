@@ -1616,10 +1616,8 @@ export function registerBotHandlers(bot) {
             await ctx.answerCbQuery('Ticket nao encontrado.');
             return;
         }
-        await closeSupportTicket(ticketId, ctx.from?.id);
-        await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
         await ctx.answerCbQuery('Ticket encerrado.');
-        await ctx.reply(getSupportAdminTicketClosedMessage(ticketId));
+        await closeSupportTicketFromTeam(bot, ctx, ticketId);
     });
     bot.action(/care_start:(status|refill|cancel)/, async (ctx) => {
         const action = ctx.match[1];

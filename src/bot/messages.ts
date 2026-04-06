@@ -788,8 +788,7 @@ export function getSupportAdminNotificationMessage(ticket: SupportTicketRecord, 
     ticket.assigned_to_name ? `👤 Em atendimento com: ${ticket.assigned_to_name}` : null,
     firstMessage ? `💬 Mensagem: ${firstMessage}` : null,
     '',
-    `💬 Responder: /reply ${ticket.id} sua mensagem`,
-    `✅ Fechar: /close ${ticket.id}`
+    '👇 Use os botões abaixo para responder ou encerrar este ticket.'
   ].filter(Boolean).join('\n');
 }
 
@@ -798,7 +797,7 @@ export function getSupportAdminReplyPrompt(ticket: SupportTicketRecord): string 
     `💬 Responder ticket #${ticket.id}`,
     '',
     `Cliente: ${ticket.telegram_id}`,
-    'Envie a resposta agora e eu encaminho ao cliente.'
+    'Responda esta mensagem agora e eu encaminho ao cliente.'
   ].join('\n');
 }
 
