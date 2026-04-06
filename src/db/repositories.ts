@@ -81,28 +81,51 @@ export async function captureLead(
   username: string | undefined,
   fullName: string,
   referredByCode?: string
-): Promise<boolean> {
-  const updated = await pool.query(
-    `update leads
-     set username = $2,
-         full_name = $3,
-         referred_by_code = coalesce(referred_by_code, $4),
-         last_contact_at = now()
-     where telegram_id = $1`,
-    [telegramId, username ?? null, fullName, referredByCode ?? null]
+): Promise<{
+  isNewLead: boolean;
+  shouldNotifyAffiliate: boolean;
+}> {
+  const normalizedReferralCode = referredByCode?.trim() ? referredByCode.trim() : null;
+  const existingLead = await pool.query<{ referred_by_code: string | null }>(
+    `select referred_by_code
+     from leads
+     where telegram_id = $1
+     order by id asc
+     limit 1`,
+    [telegramId]
   );
 
-  if ((updated.rowCount ?? 0) > 0) {
-    return false;
+  const currentLead = existingLead.rows[0];
+
+  if (currentLead) {
+    const shouldAttachReferral = !currentLead.referred_by_code && Boolean(normalizedReferralCode);
+
+    await pool.query(
+      `update leads
+       set username = $2,
+           full_name = $3,
+           referred_by_code = coalesce(referred_by_code, $4),
+           last_contact_at = now()
+       where telegram_id = $1`,
+      [telegramId, username ?? null, fullName, normalizedReferralCode]
+    );
+
+    return {
+      isNewLead: false,
+      shouldNotifyAffiliate: shouldAttachReferral
+    };
   }
 
   await pool.query(
     `insert into leads (telegram_id, username, full_name, referred_by_code)
      values ($1, $2, $3, $4)`,
-    [telegramId, username ?? null, fullName, referredByCode ?? null]
+    [telegramId, username ?? null, fullName, normalizedReferralCode]
   );
 
-  return true;
+  return {
+    isNewLead: true,
+    shouldNotifyAffiliate: Boolean(normalizedReferralCode)
+  };
 }
 
 export async function upsertServices(services: SupplierService[]): Promise<void> {

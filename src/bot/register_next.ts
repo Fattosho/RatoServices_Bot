@@ -197,11 +197,103 @@ const ORDER_ACTION_MAX_PER_WINDOW = 6;
 const ORDER_ACTION_SAME_ORDER_WINDOW_SECONDS = 90;
 const ORDER_ACTION_SAME_ORDER_MAX = 2;
 const MIN_COMMERCIAL_PACKAGE_AMOUNT = 5;
+let resolvedSupportChatId = env.supportChatId;
 
 function parseStartPayload(text: string | undefined): string | undefined {
   if (!text) return undefined;
   const parts = text.split(' ');
   return parts[1];
+}
+
+function setResolvedSupportChatId(chatId: string | number | null | undefined): void {
+  if (chatId === undefined || chatId === null) {
+    return;
+  }
+
+  const normalized = String(chatId).trim();
+  if (!normalized) {
+    return;
+  }
+
+  resolvedSupportChatId = normalized;
+}
+
+function getSupportChatIdCandidates(preferredChatId?: string | number | null): string[] {
+  const values = [preferredChatId, resolvedSupportChatId, env.supportChatId];
+  const unique = new Set<string>();
+
+  for (const value of values) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+
+    const normalized = String(value).trim();
+    if (normalized) {
+      unique.add(normalized);
+    }
+  }
+
+  return [...unique];
+}
+
+function getMigratedSupportChatId(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') {
+    return undefined;
+  }
+
+  const migrated = (error as {
+    response?: {
+      parameters?: {
+        migrate_to_chat_id?: string | number;
+      };
+    };
+  }).response?.parameters?.migrate_to_chat_id;
+
+  if (migrated === undefined || migrated === null) {
+    return undefined;
+  }
+
+  const normalized = String(migrated).trim();
+  return normalized || undefined;
+}
+
+async function callSupportChatApi<T>(
+  bot: Telegraf<MyContext>,
+  method: 'sendMessage' | 'pinChatMessage' | 'unpinAllChatMessages',
+  payload: Record<string, unknown>
+): Promise<T> {
+  const candidates = getSupportChatIdCandidates(payload.chat_id as string | number | null | undefined);
+  let lastError: unknown;
+
+  for (const chatId of candidates) {
+    try {
+      const response = await bot.telegram.callApi(method, {
+        ...payload,
+        chat_id: chatId
+      });
+      setResolvedSupportChatId(chatId);
+      return response as T;
+    } catch (error) {
+      const migratedChatId = getMigratedSupportChatId(error);
+      if (migratedChatId && migratedChatId !== chatId) {
+        try {
+          const response = await bot.telegram.callApi(method, {
+            ...payload,
+            chat_id: migratedChatId
+          });
+          setResolvedSupportChatId(migratedChatId);
+          return response as T;
+        } catch (retryError) {
+          lastError = retryError;
+          continue;
+        }
+      }
+
+      lastError = error;
+    }
+  }
+
+  throw lastError ?? new Error('Nao foi possivel acessar o chat de suporte.');
 }
 
 async function notifyAffiliateLeadStart(
@@ -783,11 +875,12 @@ async function showSelectedPackageSummary(
 }
 
 function isSupportTeamContext(ctx: MyContext): boolean {
-  if (!env.supportChatId) {
+  if (!env.supportChatId && !resolvedSupportChatId) {
     return false;
   }
 
-  return String(ctx.chat?.id ?? '') === env.supportChatId;
+  const currentChatId = String(ctx.chat?.id ?? '');
+  return getSupportChatIdCandidates().includes(currentChatId);
 }
 
 function resetSupportSession(ctx: MyContext): void {
@@ -820,28 +913,31 @@ async function notifySupportTeam(
   ticket: SupportTicketRecord,
   messageText: string
 ): Promise<void> {
-  if (!env.supportChatId) {
+  if (!env.supportChatId && !resolvedSupportChatId) {
     return;
   }
 
   try {
-    const sent = await bot.telegram.sendMessage(
-      env.supportChatId,
-      getSupportAdminNotificationMessage(ticket, messageText),
-      supportAdminTicketInline(ticket.id, ticket.status === 'closed')
-    );
+    const sent = await callSupportChatApi<{ message_id: number; chat: { id: number | string } }>(bot, 'sendMessage', {
+      text: getSupportAdminNotificationMessage(ticket, messageText),
+      disable_notification: true,
+      ...supportAdminTicketInline(ticket.id, ticket.status === 'closed')
+    });
+
+    const supportChatId = String(sent.chat.id);
+    setResolvedSupportChatId(supportChatId);
 
     try {
-      await bot.telegram.callApi('unpinAllChatMessages', {
-        chat_id: env.supportChatId
+      await callSupportChatApi(bot, 'unpinAllChatMessages', {
+        chat_id: supportChatId
       });
     } catch (pinCleanupError) {
       console.error('Falha ao limpar fixacao anterior do suporte:', pinCleanupError);
     }
 
     try {
-      await bot.telegram.callApi('pinChatMessage', {
-        chat_id: env.supportChatId,
+      await callSupportChatApi(bot, 'pinChatMessage', {
+        chat_id: supportChatId,
         message_id: sent.message_id,
         disable_notification: true
       });
@@ -1755,8 +1851,8 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
     const referredByCode = parseStartPayload(ctx.message.text);
 
     await upsertUser(telegramId, username, fullName);
-    const isFirstLead = await captureLead(telegramId, username, fullName, referredByCode);
-    if (isFirstLead) {
+    const leadCapture = await captureLead(telegramId, username, fullName, referredByCode);
+    if (leadCapture.shouldNotifyAffiliate) {
       await notifyAffiliateLeadStart(ctx, referredByCode, {
         telegramId,
         username,
