@@ -1520,7 +1520,12 @@ export function registerBotHandlers(bot) {
             customerTelegramId: ticket.telegram_id
         };
         await ctx.answerCbQuery();
-        await ctx.reply(getSupportAdminReplyPrompt(ticket));
+        await ctx.reply(getSupportAdminReplyPrompt(ticket), {
+            reply_markup: {
+                force_reply: true,
+                selective: true
+            }
+        });
     });
     bot.action(/support_admin_close:(\d+)/, async (ctx) => {
         if (!isSupportTeamContext(ctx)) {
