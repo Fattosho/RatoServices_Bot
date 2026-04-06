@@ -213,6 +213,7 @@ export function supportAdminTicketInline(ticketId, closed) {
     const rows = [];
     if (!closed) {
         rows.push([Markup.button.callback(`💬 RESPONDER #${ticketId}`, `support_admin_reply:${ticketId}`)]);
+        rows.push([Markup.button.switchToCurrentChat(`⌨️ /REPLY #${ticketId}`, `/reply ${ticketId} `)]);
         rows.push([Markup.button.callback(`✅ FECHAR #${ticketId}`, `support_admin_close:${ticketId}`)]);
     }
     return Markup.inlineKeyboard(rows);
