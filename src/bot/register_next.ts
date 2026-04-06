@@ -1011,15 +1011,18 @@ async function notifyCustomerReply(
   customerTelegramId: number,
   reply: string,
   closed = false
-): Promise<void> {
+): Promise<boolean> {
   try {
+    const cleanReply = reply.trim() || 'Recebemos uma atualizacao do suporte no seu ticket.';
     await bot.telegram.sendMessage(
       customerTelegramId,
-      closed ? getSupportClosedForCustomerMessage(ticketId) : getSupportReplyFromTeamMessage(ticketId, reply),
+      closed ? getSupportClosedForCustomerMessage(ticketId) : getSupportReplyFromTeamMessage(ticketId, cleanReply),
       supportTicketDetailInline(ticketId, closed)
     );
+    return true;
   } catch (error) {
     console.error('Falha ao notificar cliente do suporte:', error);
+    return false;
   }
 }
 
@@ -1041,7 +1044,8 @@ async function replyToSupportTicket(
   }
 
   const agentName = getSupportAgentDisplayName(ctx.from);
-  const decoratedReply = buildSupportReplyMessage(agentName, reply);
+  const cleanReply = reply.trim();
+  const decoratedReply = buildSupportReplyMessage(agentName, cleanReply);
 
   await addSupportMessage({
     ticketId: ticket.id,
@@ -1052,8 +1056,12 @@ async function replyToSupportTicket(
     assignedToName: agentName
   });
 
-  await ctx.reply(getSupportAdminReplySentMessage(ticket.id));
-  await notifyCustomerReply(bot, ticket.id, ticket.telegram_id, decoratedReply, false);
+  const delivered = await notifyCustomerReply(bot, ticket.id, ticket.telegram_id, cleanReply, false);
+  await ctx.reply(
+    delivered
+      ? `✅ Resposta do ticket #${ticket.id} entregue no privado do cliente.`
+      : `❌ Nao consegui entregar a resposta do ticket #${ticket.id} no privado do cliente.`
+  );
 }
 
 async function closeSupportTicketFromTeam(
@@ -1068,8 +1076,12 @@ async function closeSupportTicketFromTeam(
   }
 
   await closeSupportTicket(ticketId, ctx.from?.id, getSupportAgentDisplayName(ctx.from));
-  await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
-  await ctx.reply(getSupportAdminTicketClosedMessage(ticketId));
+  const delivered = await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
+  await ctx.reply(
+    delivered
+      ? getSupportAdminTicketClosedMessage(ticketId)
+      : `⚠️ Ticket #${ticketId} encerrado, mas nao consegui avisar o cliente no privado.`
+  );
 }
 
 async function sendSupportTicketDetailToUser(

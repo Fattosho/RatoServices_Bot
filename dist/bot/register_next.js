@@ -1,6 +1,6 @@
 import { session } from 'telegraf';
 import { checkoutCancelInline, guidedPackageOptionsInline, guidedPaymentOptionsInline, guidedPlatformsInline, guidedSummaryInline, guidedSimpleOptionsInline, guidedTypesInline, orderCareEntryInline, orderCarePromptInline, orderCareResultInline, profileHubInline, recentOrdersInline, refillUpsellInline, storeMainMenu as mainMenu, supportAdminTicketInline, supportAbortInline, supportCategoriesInline, supportHubInline, supportOrderSelectionInline, supportTicketDetailInline, supportTicketsInline, topupAmountsInline, upsellOptionsInline } from './keyboards.js';
-import { getBalancePurchaseSummary, getBotGuideMessage, getCheckoutLinkPrompt, getGuidedServiceSummary, getGuidedPlatformPrompt, getHowItWorksMessage, getInvalidLinkMessage, getCommercialServiceName, getManualOrderStatusMessage, getPackagePrompt, getPlatformTypePrompt, getOrderCareEntryMessage, getOrderCareManualPrompt, getOrderCareOrderNotFoundMessage, getOrderCareRateLimitMessage, getReadableSupplierStatusLabel, getFallbackOrderStatusMessage, getCancelBlockedMessage, getCancelSuccessMessage, getRefillBlockedMessage, getRefillSuccessMessage, getRepeatOrderPrompt, getSupportAdminNotificationMessage, getSupportAdminReplyPrompt, getSupportAdminReplySentMessage, getSupportAdminTicketClosedMessage, getSupportCategoryPrompt, getSupportCloseUsageMessage, getSupportClosedForCustomerMessage, getSupportGroupSetupMessage, getSupportMessage, getSupportDescriptionPrompt, getSupportHubMessage, getSupportOrderPrompt, getSupportReplyUsageMessage, getSupportReplyConfirmation, getSupportReplyFromTeamMessage, getSupportReplyPrompt, getSupportTicketCreatedMessage, getSupportTicketDetailMessage, getSupportTicketsListMessage, getUpsellMessage, getVariantPrompt, getWalletHubMessage, getWelcomeMessage } from './messages.js';
+import { getBalancePurchaseSummary, getBotGuideMessage, getCheckoutLinkPrompt, getGuidedServiceSummary, getGuidedPlatformPrompt, getHowItWorksMessage, getInvalidLinkMessage, getCommercialServiceName, getManualOrderStatusMessage, getPackagePrompt, getPlatformTypePrompt, getOrderCareEntryMessage, getOrderCareManualPrompt, getOrderCareOrderNotFoundMessage, getOrderCareRateLimitMessage, getReadableSupplierStatusLabel, getFallbackOrderStatusMessage, getCancelBlockedMessage, getCancelSuccessMessage, getRefillBlockedMessage, getRefillSuccessMessage, getRepeatOrderPrompt, getSupportAdminNotificationMessage, getSupportAdminReplyPrompt, getSupportAdminTicketClosedMessage, getSupportCategoryPrompt, getSupportCloseUsageMessage, getSupportClosedForCustomerMessage, getSupportGroupSetupMessage, getSupportMessage, getSupportDescriptionPrompt, getSupportHubMessage, getSupportOrderPrompt, getSupportReplyUsageMessage, getSupportReplyConfirmation, getSupportReplyFromTeamMessage, getSupportReplyPrompt, getSupportTicketCreatedMessage, getSupportTicketDetailMessage, getSupportTicketsListMessage, getUpsellMessage, getVariantPrompt, getWalletHubMessage, getWelcomeMessage } from './messages.js';
 import { captureLead, createOrder, createWalletTopup, debitUserWallet, getAffiliateOwnerByCode, getManagedOrderForUser, getGuidedServices, getOrderById, getServiceById, getUserReferrerCode, getUserWallet, listRecentOrders, markOrderPaid, markWalletTopupPaid, updateOrderStatus, updateOrderSupplierResult, updateWalletTopupStatus, upsertUser, creditUserWallet } from '../db/repositories.js';
 import { getCheckoutCartByTelegramId, getUserOrderDetails, markCheckoutCartRecovered, markCheckoutCartStatus, markOrderStatusNotified, touchOrderSupplierCheck, upsertCheckoutCart } from '../db/commerce.js';
 import { countRecentOrderActionLogs, createOrderActionLog } from '../db/orderCare.js';
@@ -643,10 +643,13 @@ function extractTicketIdFromSupportThreadMessage(message) {
 }
 async function notifyCustomerReply(bot, ticketId, customerTelegramId, reply, closed = false) {
     try {
-        await bot.telegram.sendMessage(customerTelegramId, closed ? getSupportClosedForCustomerMessage(ticketId) : getSupportReplyFromTeamMessage(ticketId, reply), supportTicketDetailInline(ticketId, closed));
+        const cleanReply = reply.trim() || 'Recebemos uma atualizacao do suporte no seu ticket.';
+        await bot.telegram.sendMessage(customerTelegramId, closed ? getSupportClosedForCustomerMessage(ticketId) : getSupportReplyFromTeamMessage(ticketId, cleanReply), supportTicketDetailInline(ticketId, closed));
+        return true;
     }
     catch (error) {
         console.error('Falha ao notificar cliente do suporte:', error);
+        return false;
     }
 }
 async function replyToSupportTicket(bot, ctx, ticketId, reply) {
@@ -660,7 +663,8 @@ async function replyToSupportTicket(bot, ctx, ticketId, reply) {
         return;
     }
     const agentName = getSupportAgentDisplayName(ctx.from);
-    const decoratedReply = buildSupportReplyMessage(agentName, reply);
+    const cleanReply = reply.trim();
+    const decoratedReply = buildSupportReplyMessage(agentName, cleanReply);
     await addSupportMessage({
         ticketId: ticket.id,
         senderRole: 'support',
@@ -669,8 +673,10 @@ async function replyToSupportTicket(bot, ctx, ticketId, reply) {
         assignedTo: senderId,
         assignedToName: agentName
     });
-    await ctx.reply(getSupportAdminReplySentMessage(ticket.id));
-    await notifyCustomerReply(bot, ticket.id, ticket.telegram_id, decoratedReply, false);
+    const delivered = await notifyCustomerReply(bot, ticket.id, ticket.telegram_id, cleanReply, false);
+    await ctx.reply(delivered
+        ? `✅ Resposta do ticket #${ticket.id} entregue no privado do cliente.`
+        : `❌ Nao consegui entregar a resposta do ticket #${ticket.id} no privado do cliente.`);
 }
 async function closeSupportTicketFromTeam(bot, ctx, ticketId) {
     const ticket = await getSupportTicketById(ticketId);
@@ -679,8 +685,10 @@ async function closeSupportTicketFromTeam(bot, ctx, ticketId) {
         return;
     }
     await closeSupportTicket(ticketId, ctx.from?.id, getSupportAgentDisplayName(ctx.from));
-    await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
-    await ctx.reply(getSupportAdminTicketClosedMessage(ticketId));
+    const delivered = await notifyCustomerReply(bot, ticketId, ticket.telegram_id, '', true);
+    await ctx.reply(delivered
+        ? getSupportAdminTicketClosedMessage(ticketId)
+        : `⚠️ Ticket #${ticketId} encerrado, mas nao consegui avisar o cliente no privado.`);
 }
 async function sendSupportTicketDetailToUser(ctx, ticket, editCurrentMessage = false) {
     const messages = await listSupportMessages(ticket.id, 8);
