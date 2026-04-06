@@ -18,6 +18,7 @@ const ORDER_ACTION_SAME_ORDER_WINDOW_SECONDS = 90;
 const ORDER_ACTION_SAME_ORDER_MAX = 2;
 const MIN_COMMERCIAL_PACKAGE_AMOUNT = 5;
 let resolvedSupportChatId = env.supportChatId;
+let supportPinPermissionUnavailable = false;
 function parseStartPayload(text) {
     if (!text)
         return undefined;
@@ -58,6 +59,13 @@ function getMigratedSupportChatId(error) {
     }
     const normalized = String(migrated).trim();
     return normalized || undefined;
+}
+function isPinnedMessagesPermissionError(error) {
+    if (!error || typeof error !== 'object') {
+        return false;
+    }
+    const description = error.response?.description ?? '';
+    return description.toLowerCase().includes('not enough rights to manage pinned messages');
 }
 async function callSupportChatApi(bot, method, payload) {
     const candidates = getSupportChatIdCandidates(payload.chat_id);
@@ -568,23 +576,39 @@ async function notifySupportTeam(bot, ticket, messageText) {
         });
         const supportChatId = String(sent.chat.id);
         setResolvedSupportChatId(supportChatId);
-        try {
-            await callSupportChatApi(bot, 'unpinAllChatMessages', {
-                chat_id: supportChatId
-            });
-        }
-        catch (pinCleanupError) {
-            console.error('Falha ao limpar fixacao anterior do suporte:', pinCleanupError);
-        }
-        try {
-            await callSupportChatApi(bot, 'pinChatMessage', {
-                chat_id: supportChatId,
-                message_id: sent.message_id,
-                disable_notification: true
-            });
-        }
-        catch (pinError) {
-            console.error('Falha ao fixar ticket mais recente no suporte:', pinError);
+        if (!supportPinPermissionUnavailable) {
+            try {
+                await callSupportChatApi(bot, 'unpinAllChatMessages', {
+                    chat_id: supportChatId
+                });
+            }
+            catch (pinCleanupError) {
+                if (isPinnedMessagesPermissionError(pinCleanupError)) {
+                    supportPinPermissionUnavailable = true;
+                    console.warn('Fixacao automatica de tickets desativada: o bot nao tem permissao para gerenciar mensagens fixadas nesse grupo.');
+                }
+                else {
+                    console.error('Falha ao limpar fixacao anterior do suporte:', pinCleanupError);
+                }
+            }
+            if (!supportPinPermissionUnavailable) {
+                try {
+                    await callSupportChatApi(bot, 'pinChatMessage', {
+                        chat_id: supportChatId,
+                        message_id: sent.message_id,
+                        disable_notification: true
+                    });
+                }
+                catch (pinError) {
+                    if (isPinnedMessagesPermissionError(pinError)) {
+                        supportPinPermissionUnavailable = true;
+                        console.warn('Fixacao automatica de tickets desativada: o bot nao tem permissao para gerenciar mensagens fixadas nesse grupo.');
+                    }
+                    else {
+                        console.error('Falha ao fixar ticket mais recente no suporte:', pinError);
+                    }
+                }
+            }
         }
     }
     catch (error) {
