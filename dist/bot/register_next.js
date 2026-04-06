@@ -1,7 +1,7 @@
 import { session } from 'telegraf';
 import { checkoutCancelInline, guidedPackageOptionsInline, guidedPaymentOptionsInline, guidedPlatformsInline, guidedSummaryInline, guidedSimpleOptionsInline, guidedTypesInline, orderCareEntryInline, orderCarePromptInline, orderCareResultInline, profileHubInline, recentOrdersInline, refillUpsellInline, storeMainMenu as mainMenu, supportAdminTicketInline, supportAbortInline, supportCategoriesInline, supportHubInline, supportOrderSelectionInline, supportTicketDetailInline, supportTicketsInline, topupAmountsInline, upsellOptionsInline } from './keyboards.js';
-import { getBalancePurchaseSummary, getBotGuideMessage, getCheckoutLinkPrompt, getGuidedServiceSummary, getGuidedPlatformPrompt, getHowItWorksMessage, getInvalidLinkMessage, getCommercialServiceName, getManualOrderStatusMessage, getPackagePrompt, getPlatformTypePrompt, getOrderCareEntryMessage, getOrderCareManualPrompt, getOrderCareOrderNotFoundMessage, getOrderCareRateLimitMessage, getReadableSupplierStatusLabel, getFallbackOrderStatusMessage, getCancelBlockedMessage, getCancelSuccessMessage, getRefillBlockedMessage, getRefillSuccessMessage, getRepeatOrderPrompt, getSupportAdminNotificationMessage, getSupportAdminReplyPrompt, getSupportAdminTicketClosedMessage, getSupportCategoryPrompt, getSupportCloseUsageMessage, getSupportClosedForCustomerMessage, getSupportGroupSetupMessage, getSupportMessage, getSupportDescriptionPrompt, getSupportHubMessage, getSupportOrderPrompt, getSupportReplyUsageMessage, getSupportReplyConfirmation, getSupportReplyFromTeamMessage, getSupportReplyPrompt, getSupportTicketCreatedMessage, getSupportTicketDetailMessage, getSupportTicketsListMessage, getUpsellMessage, getVariantPrompt, getWalletHubMessage, getWelcomeMessage } from './messages.js';
-import { captureLead, createOrder, createWalletTopup, debitUserWallet, getAffiliateOwnerByCode, getManagedOrderForUser, getGuidedServices, getOrderById, getServiceById, getUserReferrerCode, getUserWallet, listRecentOrders, markOrderPaid, markWalletTopupPaid, updateOrderStatus, updateOrderSupplierResult, updateWalletTopupStatus, upsertUser, creditUserWallet } from '../db/repositories.js';
+import { getBalancePurchaseSummary, getBotGuideMessage, getCheckoutLinkPrompt, getGuidedServiceSummary, getGuidedPlatformPrompt, getHowItWorksMessage, getInvalidLinkMessage, getCommercialServiceName, getManualOrderStatusMessage, getPackagePrompt, getPlatformTypePrompt, getOrderCareEntryMessage, getOrderCareManualPrompt, getOrderCareOrderNotFoundMessage, getOrderCareRateLimitMessage, getReadableSupplierStatusLabel, getFallbackOrderStatusMessage, getCancelBlockedMessage, getCancelSuccessMessage, getRefillBlockedMessage, getRefillSuccessMessage, getRepeatOrderPrompt, getSupportAdminNotificationMessage, getSupportAdminReplyPrompt, getSupportBroadcastFinishedMessage, getSupportBroadcastStartedMessage, getSupportBroadcastUsageMessage, getSupportAdminTicketClosedMessage, getSupportCategoryPrompt, getSupportCloseUsageMessage, getSupportClosedForCustomerMessage, getSupportGroupSetupMessage, getSupportMessage, getSupportDescriptionPrompt, getSupportHubMessage, getSupportOrderPrompt, getSupportReplyUsageMessage, getSupportReplyConfirmation, getSupportReplyFromTeamMessage, getSupportReplyPrompt, getSupportTicketCreatedMessage, getSupportTicketDetailMessage, getSupportTicketsListMessage, getUpsellMessage, getVariantPrompt, getWalletHubMessage, getWelcomeMessage } from './messages.js';
+import { captureLead, createOrder, createWalletTopup, debitUserWallet, getAffiliateOwnerByCode, getManagedOrderForUser, getGuidedServices, getOrderById, getServiceById, listBroadcastTelegramIds, getUserReferrerCode, getUserWallet, listRecentOrders, markOrderPaid, markWalletTopupPaid, updateOrderStatus, updateOrderSupplierResult, updateWalletTopupStatus, upsertUser, creditUserWallet } from '../db/repositories.js';
 import { getCheckoutCartByTelegramId, getUserOrderDetails, markCheckoutCartRecovered, markCheckoutCartStatus, markOrderStatusNotified, touchOrderSupplierCheck, upsertCheckoutCart } from '../db/commerce.js';
 import { countRecentOrderActionLogs, createOrderActionLog } from '../db/orderCare.js';
 import { addSupportMessage, closeSupportTicket, createSupportTicket, getSupportTicketById, getSupportTicketForUser, listSupportMessages, listSupportTicketsForTeam, listUserSupportTickets } from '../db/support.js';
@@ -596,6 +596,33 @@ function isSupportTeamContext(ctx) {
     const currentChatId = String(ctx.chat?.id ?? '');
     return getSupportChatIdCandidates().includes(currentChatId);
 }
+async function isSupportTeamAdmin(ctx) {
+    if (!isSupportTeamContext(ctx)) {
+        return false;
+    }
+    const currentChatId = ctx.chat?.id;
+    if (!currentChatId) {
+        return false;
+    }
+    if ('message' in ctx && ctx.message && 'sender_chat' in ctx.message) {
+        const senderChat = ctx.message.sender_chat;
+        if (senderChat?.id === currentChatId) {
+            return true;
+        }
+    }
+    const senderId = ctx.from?.id;
+    if (!senderId) {
+        return false;
+    }
+    try {
+        const member = await ctx.telegram.getChatMember(currentChatId, senderId);
+        return member.status === 'administrator' || member.status === 'creator';
+    }
+    catch (error) {
+        console.error('Falha ao validar admin do grupo de suporte:', error);
+        return false;
+    }
+}
 function resetSupportSession(ctx) {
     ctx.session.support = undefined;
 }
@@ -682,6 +709,86 @@ function extractTicketIdFromSupportThreadMessage(message) {
     }
     const ticketId = Number(match[1]);
     return Number.isInteger(ticketId) && ticketId > 0 ? ticketId : null;
+}
+function extractMessageBody(message) {
+    return String(message?.text ?? message?.caption ?? '').trim();
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function getBroadcastFailureKind(error) {
+    if (!error || typeof error !== 'object') {
+        return 'failed';
+    }
+    const response = error.response;
+    const description = response?.description?.toLowerCase?.() ?? '';
+    const errorCode = response?.error_code;
+    if (errorCode === 403
+        || description.includes('bot was blocked')
+        || description.includes('user is deactivated')
+        || description.includes('chat not found')
+        || description.includes('forbidden')) {
+        return 'blocked';
+    }
+    if (errorCode === 429 || description.includes('too many requests')) {
+        return 'retry';
+    }
+    return 'failed';
+}
+async function sendSupportBroadcast(bot, ctx, messageText) {
+    const recipients = await listBroadcastTelegramIds();
+    if (!recipients.length) {
+        await ctx.reply('📭 Ainda nao encontrei usuarios na base para fazer disparo.');
+        return;
+    }
+    await ctx.reply(getSupportBroadcastStartedMessage(recipients.length));
+    const senderName = getSupportAgentDisplayName(ctx);
+    const cleanMessage = messageText.trim();
+    let delivered = 0;
+    let blocked = 0;
+    let failed = 0;
+    for (const telegramId of recipients) {
+        try {
+            await bot.telegram.sendMessage(telegramId, cleanMessage);
+            delivered += 1;
+        }
+        catch (error) {
+            const failureKind = getBroadcastFailureKind(error);
+            if (failureKind === 'retry') {
+                const retryAfter = Number(error.response?.parameters?.retry_after ?? 1);
+                await sleep(Math.max(retryAfter, 1) * 1000);
+                try {
+                    await bot.telegram.sendMessage(telegramId, cleanMessage);
+                    delivered += 1;
+                }
+                catch (retryError) {
+                    const retryFailureKind = getBroadcastFailureKind(retryError);
+                    if (retryFailureKind === 'blocked') {
+                        blocked += 1;
+                    }
+                    else {
+                        failed += 1;
+                        console.error(`Falha ao reenviar disparo para ${telegramId}:`, retryError);
+                    }
+                }
+            }
+            else if (failureKind === 'blocked') {
+                blocked += 1;
+            }
+            else {
+                failed += 1;
+                console.error(`Falha ao enviar disparo para ${telegramId}:`, error);
+            }
+        }
+        await sleep(40);
+    }
+    await ctx.reply(getSupportBroadcastFinishedMessage({
+        totalRecipients: recipients.length,
+        delivered,
+        blocked,
+        failed,
+        senderName
+    }));
 }
 async function notifyCustomerReply(bot, ticketId, customerTelegramId, reply, closed = false) {
     try {
@@ -1434,6 +1541,27 @@ export function registerBotHandlers(bot) {
             title,
             isConfigured: chatId === env.supportChatId
         }));
+    });
+    bot.command('disparo', async (ctx) => {
+        if (!isSupportTeamContext(ctx)) {
+            return;
+        }
+        const isAdmin = await isSupportTeamAdmin(ctx);
+        if (!isAdmin) {
+            await ctx.reply('⛔ Esse comando esta liberado apenas para admins do grupo de suporte.');
+            return;
+        }
+        const rawText = ('text' in ctx.message ? ctx.message.text : '').trim();
+        const directMessage = rawText.replace(/^\/disparo(@[A-Za-z0-9_]+)?\s*/i, '').trim();
+        const repliedMessage = 'reply_to_message' in ctx.message
+            ? extractMessageBody(ctx.message.reply_to_message)
+            : '';
+        const messageText = directMessage || repliedMessage;
+        if (!messageText) {
+            await ctx.reply(getSupportBroadcastUsageMessage());
+            return;
+        }
+        await sendSupportBroadcast(bot, ctx, messageText);
     });
     bot.command('reply', async (ctx) => {
         if (!isSupportTeamContext(ctx)) {

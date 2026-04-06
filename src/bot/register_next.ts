@@ -52,6 +52,9 @@ import {
   getSupportAdminNotificationMessage,
   getSupportAdminReplyPrompt,
   getSupportAdminReplySentMessage,
+  getSupportBroadcastFinishedMessage,
+  getSupportBroadcastStartedMessage,
+  getSupportBroadcastUsageMessage,
   getSupportAdminTicketClosedMessage,
   getSupportCategoryPrompt,
   getSupportCloseUsageMessage,
@@ -85,6 +88,7 @@ import {
   getGuidedServices,
   getOrderById,
   getServiceById,
+  listBroadcastTelegramIds,
   getUserReferrerCode,
   getUserWallet,
   listRecentOrders,
@@ -958,6 +962,37 @@ function isSupportTeamContext(ctx: MyContext): boolean {
   return getSupportChatIdCandidates().includes(currentChatId);
 }
 
+async function isSupportTeamAdmin(ctx: MyContext): Promise<boolean> {
+  if (!isSupportTeamContext(ctx)) {
+    return false;
+  }
+
+  const currentChatId = ctx.chat?.id;
+  if (!currentChatId) {
+    return false;
+  }
+
+  if ('message' in ctx && ctx.message && 'sender_chat' in ctx.message) {
+    const senderChat = ctx.message.sender_chat as { id?: number } | undefined;
+    if (senderChat?.id === currentChatId) {
+      return true;
+    }
+  }
+
+  const senderId = ctx.from?.id;
+  if (!senderId) {
+    return false;
+  }
+
+  try {
+    const member = await ctx.telegram.getChatMember(currentChatId, senderId);
+    return member.status === 'administrator' || member.status === 'creator';
+  } catch (error) {
+    console.error('Falha ao validar admin do grupo de suporte:', error);
+    return false;
+  }
+}
+
 function resetSupportSession(ctx: MyContext): void {
   ctx.session.support = undefined;
 }
@@ -1055,6 +1090,116 @@ function extractTicketIdFromSupportThreadMessage(message: any): number | null {
 
   const ticketId = Number(match[1]);
   return Number.isInteger(ticketId) && ticketId > 0 ? ticketId : null;
+}
+
+function extractMessageBody(message: any): string {
+  return String(message?.text ?? message?.caption ?? '').trim();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getBroadcastFailureKind(error: unknown): 'blocked' | 'retry' | 'failed' {
+  if (!error || typeof error !== 'object') {
+    return 'failed';
+  }
+
+  const response = (error as {
+    response?: {
+      error_code?: number;
+      description?: string;
+      parameters?: {
+        retry_after?: number;
+      };
+    };
+  }).response;
+
+  const description = response?.description?.toLowerCase?.() ?? '';
+  const errorCode = response?.error_code;
+
+  if (
+    errorCode === 403
+    || description.includes('bot was blocked')
+    || description.includes('user is deactivated')
+    || description.includes('chat not found')
+    || description.includes('forbidden')
+  ) {
+    return 'blocked';
+  }
+
+  if (errorCode === 429 || description.includes('too many requests')) {
+    return 'retry';
+  }
+
+  return 'failed';
+}
+
+async function sendSupportBroadcast(
+  bot: Telegraf<MyContext>,
+  ctx: MyContext,
+  messageText: string
+): Promise<void> {
+  const recipients = await listBroadcastTelegramIds();
+  if (!recipients.length) {
+    await ctx.reply('📭 Ainda nao encontrei usuarios na base para fazer disparo.');
+    return;
+  }
+
+  await ctx.reply(getSupportBroadcastStartedMessage(recipients.length));
+
+  const senderName = getSupportAgentDisplayName(ctx);
+  const cleanMessage = messageText.trim();
+  let delivered = 0;
+  let blocked = 0;
+  let failed = 0;
+
+  for (const telegramId of recipients) {
+    try {
+      await bot.telegram.sendMessage(telegramId, cleanMessage);
+      delivered += 1;
+    } catch (error) {
+      const failureKind = getBroadcastFailureKind(error);
+
+      if (failureKind === 'retry') {
+        const retryAfter = Number(
+          (error as { response?: { parameters?: { retry_after?: number } } }).response?.parameters?.retry_after ?? 1
+        );
+
+        await sleep(Math.max(retryAfter, 1) * 1000);
+
+        try {
+          await bot.telegram.sendMessage(telegramId, cleanMessage);
+          delivered += 1;
+        } catch (retryError) {
+          const retryFailureKind = getBroadcastFailureKind(retryError);
+          if (retryFailureKind === 'blocked') {
+            blocked += 1;
+          } else {
+            failed += 1;
+            console.error(`Falha ao reenviar disparo para ${telegramId}:`, retryError);
+          }
+        }
+      } else if (failureKind === 'blocked') {
+        blocked += 1;
+      } else {
+        failed += 1;
+        console.error(`Falha ao enviar disparo para ${telegramId}:`, error);
+      }
+    }
+
+    await sleep(40);
+  }
+
+  await ctx.reply(
+    getSupportBroadcastFinishedMessage({
+      totalRecipients: recipients.length,
+      delivered,
+      blocked,
+      failed,
+      senderName
+    })
+  );
 }
 
 async function notifyCustomerReply(
@@ -2058,6 +2203,32 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
         isConfigured: chatId === env.supportChatId
       })
     );
+  });
+
+  bot.command('disparo', async (ctx) => {
+    if (!isSupportTeamContext(ctx)) {
+      return;
+    }
+
+    const isAdmin = await isSupportTeamAdmin(ctx);
+    if (!isAdmin) {
+      await ctx.reply('⛔ Esse comando esta liberado apenas para admins do grupo de suporte.');
+      return;
+    }
+
+    const rawText = ('text' in ctx.message ? ctx.message.text : '').trim();
+    const directMessage = rawText.replace(/^\/disparo(@[A-Za-z0-9_]+)?\s*/i, '').trim();
+    const repliedMessage = 'reply_to_message' in ctx.message
+      ? extractMessageBody(ctx.message.reply_to_message)
+      : '';
+    const messageText = directMessage || repliedMessage;
+
+    if (!messageText) {
+      await ctx.reply(getSupportBroadcastUsageMessage());
+      return;
+    }
+
+    await sendSupportBroadcast(bot, ctx, messageText);
   });
 
   bot.command('reply', async (ctx) => {

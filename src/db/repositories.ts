@@ -128,6 +128,35 @@ export async function captureLead(
   };
 }
 
+export async function listBroadcastTelegramIds(): Promise<number[]> {
+  const result = await pool.query<{ telegram_id: string | number }>(
+    `with recipients as (
+       select telegram_id, max(last_contact_at) as last_seen
+       from leads
+       where telegram_id > 0
+       group by telegram_id
+
+       union all
+
+       select telegram_id, max(updated_at) as last_seen
+       from users
+       where telegram_id > 0
+       group by telegram_id
+     )
+     select telegram_id
+     from (
+       select telegram_id, max(last_seen) as last_seen
+       from recipients
+       group by telegram_id
+     ) deduped
+     order by last_seen desc, telegram_id desc`
+  );
+
+  return result.rows
+    .map((row) => Number(row.telegram_id))
+    .filter((telegramId) => Number.isInteger(telegramId) && telegramId > 0);
+}
+
 export async function upsertServices(services: SupplierService[]): Promise<void> {
   const client = await pool.connect();
   try {

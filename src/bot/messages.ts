@@ -842,9 +842,49 @@ export function getSupportGroupSetupMessage(
     '',
     'COMANDOS DA EQUIPE:',
     '/tickets',
+    '/disparo mensagem',
     '/reply ID mensagem',
     '/close ID'
   ].filter(Boolean).join('\n');
+}
+
+export function getSupportBroadcastUsageMessage(): string {
+  return [
+    '📣 COMO USAR O DISPARO',
+    '',
+    'Use assim no grupo de suporte:',
+    '/disparo sua mensagem aqui',
+    '',
+    'Ou responda uma mensagem do grupo com:',
+    '/disparo'
+  ].join('\n');
+}
+
+export function getSupportBroadcastStartedMessage(totalRecipients: number): string {
+  return [
+    '📣 Disparo iniciado',
+    '',
+    `👥 Base encontrada: ${totalRecipients} usuarios`,
+    '⏳ Estou enviando a mensagem e depois te devolvo o resumo aqui no grupo.'
+  ].join('\n');
+}
+
+export function getSupportBroadcastFinishedMessage(summary: {
+  totalRecipients: number;
+  delivered: number;
+  blocked: number;
+  failed: number;
+  senderName: string;
+}): string {
+  return [
+    '✅ Disparo finalizado',
+    '',
+    `👤 Enviado por: ${summary.senderName}`,
+    `👥 Base total: ${summary.totalRecipients}`,
+    `✅ Entregues: ${summary.delivered}`,
+    `🚫 Bloqueados ou indisponiveis: ${summary.blocked}`,
+    `⚠️ Falhas: ${summary.failed}`
+  ].join('\n');
 }
 
 export function getSupportReplyUsageMessage(): string {
