@@ -423,6 +423,24 @@ export function getCheckoutLinkPrompt(
     ].join('\n');
   }
 
+  if (platform === 'TikTok' && type === 'Seguidores') {
+    return [
+      '👤 Envie o @usuario ou o link completo do perfil do TikTok.',
+      '',
+      'Exemplo: @seuperfil',
+      'Exemplo: tiktok.com/@seuperfil'
+    ].join('\n');
+  }
+
+  if (platform === 'TikTok' && (type === 'Curtidas' || type === 'Visualizacoes')) {
+    return [
+      '🎬 Envie o link do video do TikTok.',
+      '',
+      'Exemplo: tiktok.com/@usuario/video/SEU-LINK',
+      'Exemplo: vm.tiktok.com/SEU-LINK'
+    ].join('\n');
+  }
+
   if (platform === 'YouTube' && type === 'Seguidores') {
     return [
       '👤 Envie o link completo do canal do YouTube.',

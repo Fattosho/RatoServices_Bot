@@ -288,3 +288,22 @@ export async function requestSupplierCancel(orderId) {
         };
     }
 }
+export async function fetchSupplierBalance() {
+    try {
+        const data = await postSupplierAction('balance', {});
+        const balance = pickString(data ?? {}, ['balance', 'funds', 'credit', 'credits'], '');
+        if (!balance) {
+            return null;
+        }
+        const currency = pickString(data ?? {}, ['currency', 'currency_code', 'curr'], '');
+        return {
+            balance,
+            currency: currency || undefined,
+            raw: data
+        };
+    }
+    catch (error) {
+        console.error('Erro ao consultar saldo no fornecedor:', error.response?.data || error.message);
+        return null;
+    }
+}

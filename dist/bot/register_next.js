@@ -8,7 +8,7 @@ import { addSupportMessage, closeSupportTicket, createSupportTicket, getSupportT
 import { getAffiliatePanel, processOrderCommission, processTopupCommission } from '../services/affiliateService.js';
 import { getUpsellSuggestions, rankInstagramOffers } from '../services/offerRanking.js';
 import { createPixPayment, getPaymentStatus } from '../integrations/mercadopagoApi.js';
-import { fetchSupplierOrderStatus, requestSupplierCancel, requestSupplierRefill, submitOrder } from '../integrations/supplierApi.js';
+import { fetchSupplierBalance, fetchSupplierOrderStatus, requestSupplierCancel, requestSupplierRefill, submitOrder } from '../integrations/supplierApi.js';
 import { env } from '../config/env.js';
 import { inferServiceType, serviceHasRefillSignal, getVariantStep, normalizeGuidedCheckoutLink } from '../utils/guidedCatalog.js';
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000;
@@ -216,6 +216,9 @@ function getQuantityNoun(type, platform) {
 }
 function formatCommercialQuantity(quantity, type, platform) {
     return `${formatQuantity(quantity)} ${getQuantityNoun(type, platform)}`;
+}
+function formatCurrency(value) {
+    return `R$ ${value.toFixed(2)}`;
 }
 function getSuggestedQuantities(type, platform) {
     if (type === 'Seguidores') {
@@ -735,6 +738,33 @@ function getBroadcastFailureKind(error) {
     }
     return 'failed';
 }
+function isFixedPackageSale(service) {
+    const min = getNumeric(service.raw_payload?.min, 1);
+    const max = getNumeric(service.raw_payload?.max, 1);
+    const serviceType = String(service.raw_payload?.type ?? '').toLowerCase();
+    return serviceType === 'package' || max <= 10 || min === max;
+}
+function getServiceSupplierCost(service, quantity) {
+    const supplierPrice = getNumeric(service.supplier_price, 0);
+    if (isFixedPackageSale(service)) {
+        return Number(supplierPrice.toFixed(2));
+    }
+    return Number(((supplierPrice / 1000) * quantity).toFixed(2));
+}
+function formatSupplierBalanceText(balance) {
+    if (!balance) {
+        return 'Indisponivel no momento';
+    }
+    const numericBalance = Number(balance.balance);
+    if (Number.isFinite(numericBalance)) {
+        const currency = (balance.currency ?? '').trim().toUpperCase();
+        if (!currency || currency === 'BRL' || currency === 'R$') {
+            return formatCurrency(numericBalance);
+        }
+        return `${numericBalance.toFixed(2)} ${currency}`;
+    }
+    return balance.currency ? `${balance.balance} ${balance.currency}` : balance.balance;
+}
 async function sendSupportBroadcast(bot, ctx, messageText) {
     const recipients = await listBroadcastTelegramIds();
     if (!recipients.length) {
@@ -789,6 +819,37 @@ async function sendSupportBroadcast(bot, ctx, messageText) {
         failed,
         senderName
     }));
+}
+async function notifySupportSale(bot, orderId, service, quantity, totalAmount, supplierOrderId, supplierSubmissionSucceeded) {
+    if (!env.supportChatId && !resolvedSupportChatId) {
+        return;
+    }
+    const supplierCost = getServiceSupplierCost(service, quantity);
+    const profit = Number((totalAmount - supplierCost).toFixed(2));
+    const supplierBalance = await fetchSupplierBalance();
+    const type = inferServiceType(service.catalog_platform ?? 'Instagram', service);
+    const quantityLabel = formatCommercialQuantity(quantity, type, service.catalog_platform);
+    const lines = [
+        supplierSubmissionSucceeded ? '💸 Nova venda confirmada' : '⚠️ Venda confirmada com falha no envio',
+        '',
+        `🧾 Pedido #${orderId}`,
+        `🛍️ Servico: ${getCommercialServiceName(service.name)}`,
+        `📦 Quantidade: ${quantityLabel}`,
+        `💰 Custo na API: ${formatCurrency(supplierCost)}`,
+        `💳 Pago pelo cliente: ${formatCurrency(totalAmount)}`,
+        `📈 Lucro bruto: ${formatCurrency(profit)}`,
+        `🏦 Credito atual na API: ${formatSupplierBalanceText(supplierBalance)}`,
+        supplierOrderId ? `🔗 Pedido na API: ${supplierOrderId}` : '🚨 Pedido ainda nao gerou ID na API'
+    ];
+    try {
+        await callSupportChatApi(bot, 'sendMessage', {
+            text: lines.join('\n'),
+            disable_notification: false
+        });
+    }
+    catch (error) {
+        console.error('Falha ao notificar venda no grupo de suporte:', error);
+    }
 }
 async function notifyCustomerReply(bot, ticketId, customerTelegramId, reply, closed = false) {
     try {
@@ -1250,19 +1311,23 @@ async function sendTopupPix(ctx, amount) {
     }, 7000);
     setTimeout(() => clearInterval(pollInterval), 30 * 60 * 1000);
 }
-async function finalizeSupplierSubmission(ctx, orderId, service, link, quantity) {
+async function finalizeSupplierSubmission(bot, ctx, orderId, service, link, quantity) {
+    const order = await getOrderById(orderId);
+    const totalAmount = Number(order?.total_amount ?? 0);
     const supplierOrderId = await submitOrder(service.external_service_id, link, quantity);
     if (supplierOrderId) {
         await updateOrderSupplierResult(orderId, 'submitted', supplierOrderId);
         await markOrderStatusNotified(orderId, 'submitted');
+        await notifySupportSale(bot, orderId, service, quantity, totalAmount, supplierOrderId, true);
         await ctx.reply(`🚀 Pedido #${orderId} confirmado e iniciado com sucesso.`, mainMenu());
         await sendUpsellSuggestions(ctx, service);
         return;
     }
     await updateOrderSupplierResult(orderId, 'failed');
+    await notifySupportSale(bot, orderId, service, quantity, totalAmount, null, false);
     await ctx.reply(`⚠️ O pagamento do pedido #${orderId} foi confirmado, mas houve uma falha ao iniciar o pedido automaticamente.`, mainMenu());
 }
-async function sendOrderPix(ctx) {
+async function sendOrderPix(bot, ctx) {
     const senderId = ctx.from?.id;
     const purchase = ctx.session.purchase;
     if (!senderId || !purchase?.serviceId || !purchase.link || !purchase.quantity || !purchase.amount) {
@@ -1340,7 +1405,7 @@ async function sendOrderPix(ctx) {
                     return;
                 await processOrderCommission(orderId);
                 await ctx.reply(`✅ Pagamento do pedido #${orderId} confirmado. Iniciando agora...`);
-                await finalizeSupplierSubmission(ctx, orderId, service, orderLink, orderQuantity);
+                await finalizeSupplierSubmission(bot, ctx, orderId, service, orderLink, orderQuantity);
                 await finalizePurchaseSession(ctx, 'converted', orderId);
             }
             else if (status === 'cancelled' || status === 'rejected') {
@@ -2102,7 +2167,7 @@ export function registerBotHandlers(bot) {
         await markOrderPaid(orderId);
         await processOrderCommission(orderId);
         await ctx.reply(`✅ Pedido #${orderId} confirmado com saldo. Iniciando agora...`);
-        await finalizeSupplierSubmission(ctx, orderId, service, purchase.link, purchase.quantity);
+        await finalizeSupplierSubmission(bot, ctx, orderId, service, purchase.link, purchase.quantity);
         await finalizePurchaseSession(ctx, 'converted', orderId);
         await ctx.answerCbQuery();
     });

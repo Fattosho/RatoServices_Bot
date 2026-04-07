@@ -218,6 +218,12 @@ export type SupplierMutationResponse = {
   raw?: any;
 };
 
+export type SupplierBalanceResponse = {
+  balance: string;
+  currency?: string;
+  raw?: any;
+};
+
 function normalizeSupplierStatus(rawStatus: string | undefined): string {
   const status = (rawStatus ?? '').trim().toLowerCase();
 
@@ -341,5 +347,26 @@ export async function requestSupplierCancel(orderId: string): Promise<SupplierMu
       message,
       raw: responseData ?? { message: error.message }
     };
+  }
+}
+
+export async function fetchSupplierBalance(): Promise<SupplierBalanceResponse | null> {
+  try {
+    const data = await postSupplierAction('balance', {});
+    const balance = pickString(data ?? {}, ['balance', 'funds', 'credit', 'credits'], '');
+    if (!balance) {
+      return null;
+    }
+
+    const currency = pickString(data ?? {}, ['currency', 'currency_code', 'curr'], '');
+
+    return {
+      balance,
+      currency: currency || undefined,
+      raw: data
+    };
+  } catch (error: any) {
+    console.error('Erro ao consultar saldo no fornecedor:', error.response?.data || error.message);
+    return null;
   }
 }

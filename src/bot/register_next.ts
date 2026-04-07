@@ -136,6 +136,7 @@ import {
 } from '../services/offerRanking.js';
 import { createPixPayment, getPaymentStatus } from '../integrations/mercadopagoApi.js';
 import {
+  fetchSupplierBalance,
   fetchSupplierOrderStatus,
   requestSupplierCancel,
   requestSupplierRefill,
@@ -448,6 +449,10 @@ function getQuantityNoun(type?: string, platform?: string): string {
 
 function formatCommercialQuantity(quantity: number, type?: string, platform?: string): string {
   return `${formatQuantity(quantity)} ${getQuantityNoun(type, platform)}`;
+}
+
+function formatCurrency(value: number): string {
+  return `R$ ${value.toFixed(2)}`;
 }
 
 function getSuggestedQuantities(type?: string, platform?: string): number[] {
@@ -1135,6 +1140,40 @@ function getBroadcastFailureKind(error: unknown): 'blocked' | 'retry' | 'failed'
   return 'failed';
 }
 
+function isFixedPackageSale(service: GuidedInstagramService): boolean {
+  const min = getNumeric(service.raw_payload?.min, 1);
+  const max = getNumeric(service.raw_payload?.max, 1);
+  const serviceType = String(service.raw_payload?.type ?? '').toLowerCase();
+  return serviceType === 'package' || max <= 10 || min === max;
+}
+
+function getServiceSupplierCost(service: GuidedInstagramService, quantity: number): number {
+  const supplierPrice = getNumeric((service as any).supplier_price, 0);
+  if (isFixedPackageSale(service)) {
+    return Number(supplierPrice.toFixed(2));
+  }
+
+  return Number(((supplierPrice / 1000) * quantity).toFixed(2));
+}
+
+function formatSupplierBalanceText(balance: Awaited<ReturnType<typeof fetchSupplierBalance>>): string {
+  if (!balance) {
+    return 'Indisponivel no momento';
+  }
+
+  const numericBalance = Number(balance.balance);
+  if (Number.isFinite(numericBalance)) {
+    const currency = (balance.currency ?? '').trim().toUpperCase();
+    if (!currency || currency === 'BRL' || currency === 'R$') {
+      return formatCurrency(numericBalance);
+    }
+
+    return `${numericBalance.toFixed(2)} ${currency}`;
+  }
+
+  return balance.currency ? `${balance.balance} ${balance.currency}` : balance.balance;
+}
+
 async function sendSupportBroadcast(
   bot: Telegraf<MyContext>,
   ctx: MyContext,
@@ -1200,6 +1239,48 @@ async function sendSupportBroadcast(
       senderName
     })
   );
+}
+
+async function notifySupportSale(
+  bot: Telegraf<MyContext>,
+  orderId: number,
+  service: GuidedInstagramService,
+  quantity: number,
+  totalAmount: number,
+  supplierOrderId: string | null,
+  supplierSubmissionSucceeded: boolean
+): Promise<void> {
+  if (!env.supportChatId && !resolvedSupportChatId) {
+    return;
+  }
+
+  const supplierCost = getServiceSupplierCost(service, quantity);
+  const profit = Number((totalAmount - supplierCost).toFixed(2));
+  const supplierBalance = await fetchSupplierBalance();
+  const type = inferServiceType(service.catalog_platform ?? 'Instagram', service);
+  const quantityLabel = formatCommercialQuantity(quantity, type, service.catalog_platform);
+
+  const lines = [
+    supplierSubmissionSucceeded ? '💸 Nova venda confirmada' : '⚠️ Venda confirmada com falha no envio',
+    '',
+    `🧾 Pedido #${orderId}`,
+    `🛍️ Servico: ${getCommercialServiceName(service.name)}`,
+    `📦 Quantidade: ${quantityLabel}`,
+    `💰 Custo na API: ${formatCurrency(supplierCost)}`,
+    `💳 Pago pelo cliente: ${formatCurrency(totalAmount)}`,
+    `📈 Lucro bruto: ${formatCurrency(profit)}`,
+    `🏦 Credito atual na API: ${formatSupplierBalanceText(supplierBalance)}`,
+    supplierOrderId ? `🔗 Pedido na API: ${supplierOrderId}` : '🚨 Pedido ainda nao gerou ID na API'
+  ];
+
+  try {
+    await callSupportChatApi(bot, 'sendMessage', {
+      text: lines.join('\n'),
+      disable_notification: false
+    });
+  } catch (error) {
+    console.error('Falha ao notificar venda no grupo de suporte:', error);
+  }
 }
 
 async function notifyCustomerReply(
@@ -1834,16 +1915,20 @@ async function sendTopupPix(ctx: MyContext, amount: number): Promise<void> {
 }
 
 async function finalizeSupplierSubmission(
+  bot: Telegraf<MyContext>,
   ctx: MyContext,
   orderId: number,
   service: GuidedInstagramService,
   link: string,
   quantity: number
 ): Promise<void> {
+  const order = await getOrderById(orderId);
+  const totalAmount = Number(order?.total_amount ?? 0);
   const supplierOrderId = await submitOrder(service.external_service_id, link, quantity);
   if (supplierOrderId) {
     await updateOrderSupplierResult(orderId, 'submitted', supplierOrderId);
     await markOrderStatusNotified(orderId, 'submitted');
+    await notifySupportSale(bot, orderId, service, quantity, totalAmount, supplierOrderId, true);
     await ctx.reply(
       `🚀 Pedido #${orderId} confirmado e iniciado com sucesso.`,
       mainMenu()
@@ -1853,13 +1938,14 @@ async function finalizeSupplierSubmission(
   }
 
   await updateOrderSupplierResult(orderId, 'failed');
+  await notifySupportSale(bot, orderId, service, quantity, totalAmount, null, false);
   await ctx.reply(
     `⚠️ O pagamento do pedido #${orderId} foi confirmado, mas houve uma falha ao iniciar o pedido automaticamente.`,
     mainMenu()
   );
 }
 
-async function sendOrderPix(ctx: MyContext): Promise<void> {
+async function sendOrderPix(bot: Telegraf<MyContext>, ctx: MyContext): Promise<void> {
   const senderId = ctx.from?.id;
   const purchase = ctx.session.purchase;
   if (!senderId || !purchase?.serviceId || !purchase.link || !purchase.quantity || !purchase.amount) {
@@ -1957,7 +2043,7 @@ async function sendOrderPix(ctx: MyContext): Promise<void> {
 
         await processOrderCommission(orderId);
         await ctx.reply(`✅ Pagamento do pedido #${orderId} confirmado. Iniciando agora...`);
-        await finalizeSupplierSubmission(ctx, orderId, service, orderLink, orderQuantity);
+        await finalizeSupplierSubmission(bot, ctx, orderId, service, orderLink, orderQuantity);
         await finalizePurchaseSession(ctx, 'converted', orderId);
       } else if (status === 'cancelled' || status === 'rejected') {
         clearInterval(pollInterval);
@@ -2911,7 +2997,7 @@ export function registerBotHandlers(bot: Telegraf<MyContext>) {
     await processOrderCommission(orderId);
 
     await ctx.reply(`✅ Pedido #${orderId} confirmado com saldo. Iniciando agora...`);
-    await finalizeSupplierSubmission(ctx, orderId, service, purchase.link, purchase.quantity);
+    await finalizeSupplierSubmission(bot, ctx, orderId, service, purchase.link, purchase.quantity);
     await finalizePurchaseSession(ctx, 'converted', orderId);
     await ctx.answerCbQuery();
   });

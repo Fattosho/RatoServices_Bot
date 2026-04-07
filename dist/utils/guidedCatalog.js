@@ -122,6 +122,16 @@ export function getVariantStep(platform, type) {
             ]
         };
     }
+    if (type === 'Seguidores' && platform === 'TikTok') {
+        return {
+            kind: 'origin',
+            title: 'Escolha a origem',
+            options: [
+                { label: 'Brasileiro', value: 'Brasileiro' },
+                { label: 'Internacional', value: 'Internacional' }
+            ]
+        };
+    }
     if (type === 'Curtidas' && platform === 'Instagram') {
         return {
             kind: 'origin',
@@ -130,6 +140,16 @@ export function getVariantStep(platform, type) {
                 { label: 'Brasileira', value: 'Brasileiro' },
                 { label: 'Internacional', value: 'Internacional' },
                 { label: 'Mista', value: 'Misto' }
+            ]
+        };
+    }
+    if (type === 'Curtidas' && platform === 'TikTok') {
+        return {
+            kind: 'origin',
+            title: 'Escolha a origem',
+            options: [
+                { label: 'Brasileira', value: 'Brasileiro' },
+                { label: 'Internacional', value: 'Internacional' }
             ]
         };
     }
@@ -507,6 +527,20 @@ export function getMandatoryInstructions(platform, type) {
             'Nao troque o link nem apague o conteudo ate a conclusao.'
         ];
     }
+    if (platform === 'TikTok' && type === 'Seguidores') {
+        return [
+            'Deixe o perfil do TikTok publico durante toda a entrega.',
+            'Nao altere o @, nome de usuario ou privacidade ate a conclusao.',
+            'Evite fazer outro pedido de seguidores no mesmo perfil ao mesmo tempo.'
+        ];
+    }
+    if (platform === 'TikTok' && (type === 'Curtidas' || type === 'Visualizacoes')) {
+        return [
+            'Envie o link exato do video do TikTok.',
+            'Mantenha o video e o perfil publicos durante a entrega.',
+            'Nao apague, arquive nem altere o link ate a conclusao.'
+        ];
+    }
     if (platform === 'Facebook' && type === 'Seguidores') {
         return [
             'Deixe o perfil ou a pagina em modo publico.',
@@ -551,6 +585,10 @@ export function getMandatoryInstructions(platform, type) {
 export function getLinkTargetLabel(platform, type) {
     if (platform === 'Instagram' && type === 'Seguidores')
         return 'perfil';
+    if (platform === 'TikTok' && type === 'Seguidores')
+        return 'perfil do TikTok';
+    if (platform === 'TikTok' && (type === 'Curtidas' || type === 'Visualizacoes'))
+        return 'link do video do TikTok';
     if (platform === 'YouTube' && type === 'Seguidores')
         return 'link do canal';
     if (platform === 'YouTube' && type === 'Curtidas')
